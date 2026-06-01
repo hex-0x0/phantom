@@ -25,8 +25,8 @@ module relaxstar
  implicit none
  public :: relax_star,write_options_relax,read_options_relax
 
- real,    private :: tol_ekin = 1.e-7 ! criteria for being converged
- integer, private :: maxits = 1000
+ real,    public  :: tol_ekin = 1.e-7 ! criteria for being converged
+ integer, public  :: maxits = 1000
 
  real,    private :: gammaprev,hfactprev,mass1prev
  integer, private :: ieos_prev
@@ -293,9 +293,8 @@ subroutine relax_star(nt,rho,pr,r,npart,xyzh,use_var_comp,Xfrac,Yfrac,mu,&
           ! before writing a file, set the real thermal energy profile
           ! so the file is useable as a starting file for the main calculation
           !
-          if (use_var_comp) call set_star_composition(use_var_comp,&
-                                 eos_outputs_mu(ieos_prev),npart,xyzh,&
-                                 Xfrac,Yfrac,mu,mr,mstar,eos_vars,npin=i1,x0=x0)
+          if (use_var_comp) call set_star_composition(eos_outputs_mu(ieos_prev),&
+                                 npart,xyzh,Xfrac,Yfrac,mu,mr,eos_vars,npin=i1,x0=x0)
 
           if (maxvxyzu==4) call set_star_thermalenergy(ieos_prev,rho,pr,&
                                 r,nt,npart,xyzh,vxyzu,rad,eos_vars,.true.,&
