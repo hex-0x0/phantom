@@ -119,7 +119,7 @@ subroutine increase_mpi_memory
  type(celldens),  allocatable, target :: dens_cells_tmp(:,:)
  type(cellforce), allocatable, target :: force_cells_tmp(:,:)
 
- stacksize_new = int(real(stacksize) * factor)
+ stacksize_new = max(stacksize + 1, int(real(stacksize) * factor))
  write(iprint, *) 'MPI dens stack exceeded on', id, 'increasing size to', stacksize_new
 
  ! Expand density
@@ -283,25 +283,26 @@ subroutine reserve_stack_dens(stack,i)
  type(stackdens), intent(inout) :: stack
  integer,         intent(out)   :: i
 
- !$omp atomic capture
+ !$omp critical(mpimemory_resize)
+ if (stack%n >= stack%maxlength) call increase_mpi_memory
+
  stack%n = stack%n + 1
  i = stack%n
- !$omp end atomic
-
- if (i > stack%maxlength) call fatal('dens','MPI stack exceeded')
+ !$omp end critical(mpimemory_resize)
 
 end subroutine reserve_stack_dens
 
+
 subroutine reserve_stack_force(stack,i)
  type(stackforce), intent(inout) :: stack
- integer,          intent(out)   :: i
+ integer,         intent(out)   :: i
 
- !$omp atomic capture
+ !$omp critical(mpimemory_resize)
+ if (stack%n >= stack%maxlength) call increase_mpi_memory
+
  stack%n = stack%n + 1
  i = stack%n
- !$omp end atomic
-
- if (i > stack%maxlength) call fatal('force','MPI stack exceeded')
+ !$omp end critical(mpimemory_resize)
 
 end subroutine reserve_stack_force
 
