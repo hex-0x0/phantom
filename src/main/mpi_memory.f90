@@ -66,6 +66,11 @@ module mpimemory
 
  integer, public :: stacksize
 
+ ! High-water mark of stack occupancy since the last resize check. Recorded by
+ ! reserve_stack and consumed by reset_stacks, which is the only place the
+ ! stacks may safely grow (see the note in reserve_stack_dens).
+ integer, private :: stack_hiwater = 0
+
  private
 
  ! primary chunk of memory requested using alloc
@@ -109,8 +114,20 @@ subroutine allocate_mpi_memory(npart, stacksize_in)
 
 end subroutine allocate_mpi_memory
 
-subroutine increase_mpi_memory
+!----------------------------------------------------------------
+!+
+!  Grow the MPI export stacks.
+!
+!  MUST ONLY BE CALLED FROM SERIAL CODE (outside any !$omp parallel
+!  region). This routine reallocates dens_cells/force_cells, which every
+!  stack points into, so it invalidates stack%cells for all stacks at
+!  once. Calling it while other threads may be dereferencing those
+!  pointers is a use-after-free. reset_stacks is the designated caller.
+!+
+!----------------------------------------------------------------
+subroutine increase_mpi_memory(minsize)
  use io, only:id
+ integer, intent(in), optional :: minsize
  real, parameter :: factor = 1.5
  integer         :: stacksize_new
  integer         :: allocstat
@@ -120,7 +137,8 @@ subroutine increase_mpi_memory
  type(cellforce), allocatable, target :: force_cells_tmp(:,:)
 
  stacksize_new = max(stacksize + 1, int(real(stacksize) * factor))
- write(iprint, *) 'MPI dens stack exceeded on', id, 'increasing size to', stacksize_new
+ if (present(minsize)) stacksize_new = max(stacksize_new, minsize)
+ write(iprint, *) 'MPI stack growing on', id, 'from', stacksize, 'to', stacksize_new
 
  ! Expand density
  call move_alloc(dens_cells, dens_cells_tmp)
@@ -148,18 +166,29 @@ subroutine calculate_stacksize(npart)
  use dim, only:mpi,minpart
  use io,  only:nprocs,id,master
  integer, intent(in) :: npart
- integer, parameter  :: safety = 8
+ ! safety = 32 reproduces the buffer size that ran successfully to 32 ranks
+ ! before the /nprocs bug was introduced. It can be lowered now that growth in
+ ! reset_stacks is safe, but the FIRST pass has no demand history to grow from,
+ ! so it must be large enough to get through it.
+ integer, parameter  :: safety = 32
 
  ! size of the stack needed for communication,
  ! should be at least the maximum number of cells that need
  ! to be exported to other tasks.
  !
- ! if it is not large enough, it will be automatically expanded
+ ! if it is not large enough, reset_stacks expands it between passes
 
- ! number of particles per cell, divided by number of tasks
+ ! number of particles per cell
  if (mpi .and. nprocs > 1) then
-    ! assume that every cell will be exported, with some safety factor
-    stacksize = (npart / minpart / nprocs) * safety
+    ! assume that every cell will be exported, with some safety factor.
+    !
+    ! NOTE: npart here is ALREADY a per-task count -- the only caller,
+    ! allocate_memory in memory.f90, passes n = min(nprocs,4)*ntot/nprocs.
+    ! Dividing by nprocs again made the buffer scale as ntot/nprocs**2, i.e. it
+    ! shrank quadratically with task count while the number of cells each task
+    ! actually exports grows with task count on clustered, self-gravitating
+    ! problems. That is what made 'MPI stack exceeded' inevitable at scale.
+    stacksize = (npart / minpart) * safety
 
     if (id == master) then
        write(iprint, *) 'MPI memory stack size = ', stacksize
@@ -284,10 +313,26 @@ subroutine reserve_stack_dens(stack,i)
  integer,         intent(out)   :: i
 
  !$omp critical(mpimemory_resize)
- if (stack%n >= stack%maxlength) call increase_mpi_memory
+ !
+ ! Do NOT grow the stack here. This runs inside the !$omp parallel region of
+ ! densityiterate, and increase_mpi_memory reallocates the shared dens_cells
+ ! array that *every* dens stack points into. The critical section below
+ ! serialises reservations against each other, but not against the unlocked
+ ! reads of stack_remote%cells / stack_waiting%cells in the hot loops of
+ ! densityiterate, nor against write_cell, which dereference stack%cells with
+ ! no lock at all. Growing here therefore frees memory out from under other
+ ! threads and segfaults non-deterministically (a run that grew 75 times could
+ ! survive while an identical one that grew 6 times died).
+ !
+ ! Growth happens in reset_stacks instead, which is called from densityiterate
+ ! and force_all before the parallel region opens. We only record demand here.
+ !
+ if (stack%n >= stack%maxlength) &
+    call fatal('dens','MPI stack exceeded - increase safety in calculate_stacksize')
 
  stack%n = stack%n + 1
  i = stack%n
+ stack_hiwater = max(stack_hiwater,stack%n)
  !$omp end critical(mpimemory_resize)
 
 end subroutine reserve_stack_dens
@@ -298,15 +343,40 @@ subroutine reserve_stack_force(stack,i)
  integer,         intent(out)   :: i
 
  !$omp critical(mpimemory_resize)
- if (stack%n >= stack%maxlength) call increase_mpi_memory
+ ! see the note in reserve_stack_dens: growing here is not thread-safe
+ if (stack%n >= stack%maxlength) &
+    call fatal('force','MPI stack exceeded - increase safety in calculate_stacksize')
 
  stack%n = stack%n + 1
  i = stack%n
+ stack_hiwater = max(stack_hiwater,stack%n)
  !$omp end critical(mpimemory_resize)
 
 end subroutine reserve_stack_force
 
+!----------------------------------------------------------------
+!+
+!  Reset the stacks at the start of a density or force pass, and grow
+!  them if the previous pass ran close to capacity.
+!
+!  This is the designated safe point for resizing: densityiterate and
+!  force_all both call it before opening their !$omp parallel region,
+!  so no thread can be holding a pointer into dens_cells/force_cells.
+!  Growing here, ahead of demand, is what keeps reserve_stack from
+!  having to grow (unsafely) mid-region.
+!+
+!----------------------------------------------------------------
 subroutine reset_stacks
+ integer :: needed
+
+ ! grow if the previous pass came within 20% of capacity, so that demand which
+ ! is still rising is satisfied before the next pass rather than during it
+ if (stacksize > 0 .and. stack_hiwater > (4*stacksize)/5) then
+    needed = max(2*stack_hiwater, stacksize+1)
+    call increase_mpi_memory(minsize=needed)
+ endif
+ stack_hiwater = 0
+
  dens_stack_1%n=0
  dens_stack_2%n=0
  dens_stack_3%n=0
