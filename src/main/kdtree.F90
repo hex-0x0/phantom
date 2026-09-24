@@ -1690,7 +1690,11 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
        rcut  = max(rcuti,rcutj)
     endif
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
-    if (gravity) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
+    ! only open nodes on the gravity criterion when this walk computes gravity.
+    ! gravity is a compile-time flag, so testing it alone also opened nodes for
+    ! the density pass and every pure neighbour search, and on the global tree
+    ! that exported cells to ranks that could not hold any of their neighbours.
+    if (get_f) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
     if_open_node: if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (leaf_is_active(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
           if_global_walk: if (global_walk) then
