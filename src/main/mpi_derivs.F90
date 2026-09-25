@@ -23,6 +23,7 @@ module mpiderivs
 #endif
  use io,             only:id,nprocs
  use mpiutils,       only:comm_cellexchange,comm_cellcount
+ use mpiprof,        only:wtime,t_rww,t_finish,ncell_export,nmsg_export,ntarget_hist,ncell_remote
 
  implicit none
  interface init_cell_exchange
@@ -74,6 +75,10 @@ module mpiderivs
  private
 
  integer, allocatable :: countrequest(:)
+ ! requests for the count messages sent in recv_while_wait. These are kept
+ ! apart from the per-thread cell send requests, which they used to overwrite,
+ ! and are completed before the counts they point at are reset.
+ integer, allocatable :: countsendrequest(:)
 
 contains
 
@@ -83,6 +88,10 @@ subroutine allocate_cell_comms_arrays
  if (mpi) then
     call allocate_array('cell_counters', cell_counters, nprocs, 3)
     call allocate_array('countrequest',  countrequest,  nprocs)
+    call allocate_array('countsendrequest', countsendrequest, nprocs)
+#ifdef MPI
+    countsendrequest = MPI_REQUEST_NULL
+#endif
  else
     ! dummy cell counters that are required to prevent runtime errors
     ! in dens and force
@@ -93,6 +102,7 @@ end subroutine allocate_cell_comms_arrays
 subroutine deallocate_cell_comms_arrays
  if (allocated(cell_counters)) deallocate(cell_counters)
  if (allocated(countrequest )) deallocate(countrequest )
+ if (allocated(countsendrequest)) deallocate(countsendrequest)
 end subroutine deallocate_cell_comms_arrays
 
 !----------------------------------------------------------------
@@ -227,6 +237,17 @@ subroutine send_celldens(cell,targets,irequestsend,xsendbuf,counters,dtype)
 #ifdef MPI
  integer                            :: newproc,mpierr
 
+ if (cell%owner == id) then
+    !$omp atomic
+    ncell_export(1) = ncell_export(1) + 1
+    !$omp atomic
+    nmsg_export(1) = nmsg_export(1) + count(targets) - merge(1,0,targets(id+1))
+    !$omp atomic
+    ntarget_hist(1,min(count(targets),64)) = ntarget_hist(1,min(count(targets),64)) + 1
+ else
+    !$omp atomic
+    ncell_remote(1) = ncell_remote(1) + 1
+ endif
  xsendbuf = cell
  irequestsend = MPI_REQUEST_NULL
 
@@ -257,6 +278,17 @@ subroutine send_cellforce(cell,targets,irequestsend,xsendbuf,counters,dtype)
 #ifdef MPI
  integer                            :: newproc,mpierr
 
+ if (cell%owner == id) then
+    !$omp atomic
+    ncell_export(2) = ncell_export(2) + 1
+    !$omp atomic
+    nmsg_export(2) = nmsg_export(2) + count(targets) - merge(1,0,targets(id+1))
+    !$omp atomic
+    ntarget_hist(2,min(count(targets),64)) = ntarget_hist(2,min(count(targets),64)) + 1
+ else
+    !$omp atomic
+    ncell_remote(2) = ncell_remote(2) + 1
+ endif
  xsendbuf = cell
  irequestsend = MPI_REQUEST_NULL
 
@@ -312,20 +344,30 @@ subroutine recv_while_wait_dens(stack,xrecvbuf,irequestrecv,irequestsend,thread_
 #ifdef MPI
  integer             :: newproc
  integer             :: mpierr
+ real(kind=8)        :: tw0
+
+ tw0 = wtime()
 
 !--signal to other OMP threads that this thread has finished sending
  thread_complete(omp_thread_num()+1) = .true.
+ !$omp flush
 
- !--continue receiving cells until all OMP threads have finished sending
+ !--continue receiving cells until all OMP threads have finished sending.
+ !  thread_complete is written by other threads, so it has to be flushed
+ !  each time round or the compiler may keep reading a stale copy
  do while (.not. all(thread_complete))
     call recv_cells(stack,xrecvbuf,irequestrecv,counters)
+    !$omp flush
  enddo
 
  !--signal to other MPI tasks that this task has finished sending
  !$omp masked
  do newproc=0,nprocs-1
     if (newproc /= id) then
-       call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount,irequestsend(newproc+1),mpierr)
+       call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount, &
+                      countsendrequest(newproc+1),mpierr)
+    else
+       countsendrequest(newproc+1) = MPI_REQUEST_NULL
     endif
  enddo
  !$omp end masked
@@ -336,14 +378,21 @@ subroutine recv_while_wait_dens(stack,xrecvbuf,irequestrecv,irequestsend,thread_
     !$omp masked
     call check_complete(counters,ncomplete_mpi)
     !$omp end masked
+    !$omp flush
  enddo
 
  call barrier_mpi
 
  !$omp masked
+ ! every rank has received every count by now, so these complete at once.
+ ! It must happen before reset_cell_counters zeroes the send buffers.
+ call MPI_WAITALL(nprocs,countsendrequest,MPI_STATUSES_IGNORE,mpierr)
  ncomplete_mpi = 0
  !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
+
+ !$omp atomic
+ t_rww(1) = t_rww(1) + (wtime()-tw0)
 
 #endif
 
@@ -362,20 +411,30 @@ subroutine recv_while_wait_force(stack,xrecvbuf,irequestrecv,irequestsend,thread
 #ifdef MPI
  integer             :: newproc
  integer             :: mpierr
+ real(kind=8)        :: tw0
+
+ tw0 = wtime()
 
  !--signal to other OMP threads that this thread has finished sending
  thread_complete(omp_thread_num()+1) = .true.
+ !$omp flush
 
- !--continue receiving cells until all OMP threads have finished sending
+ !--continue receiving cells until all OMP threads have finished sending.
+ !  thread_complete is written by other threads, so it has to be flushed
+ !  each time round or the compiler may keep reading a stale copy
  do while (.not. all(thread_complete))
     call recv_cells(stack,xrecvbuf,irequestrecv,counters)
+    !$omp flush
  enddo
 
  !--signal to other MPI tasks that this task has finished sending
  !$omp masked
  do newproc=0,nprocs-1
     if (newproc /= id) then
-       call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount,irequestsend(newproc+1),mpierr)
+       call MPI_ISEND(counters(newproc+1,isent),1,MPI_INTEGER4,newproc,0,comm_cellcount, &
+                      countsendrequest(newproc+1),mpierr)
+    else
+       countsendrequest(newproc+1) = MPI_REQUEST_NULL
     endif
  enddo
  !$omp end masked
@@ -386,14 +445,21 @@ subroutine recv_while_wait_force(stack,xrecvbuf,irequestrecv,irequestsend,thread
     !$omp masked
     call check_complete(counters,ncomplete_mpi)
     !$omp end masked
+    !$omp flush
  enddo
 
  call barrier_mpi
 
  !$omp masked
+ ! every rank has received every count by now, so these complete at once.
+ ! It must happen before reset_cell_counters zeroes the send buffers.
+ call MPI_WAITALL(nprocs,countsendrequest,MPI_STATUSES_IGNORE,mpierr)
  ncomplete_mpi = 0
  !$omp end masked
  thread_complete(omp_thread_num()+1) = .false.
+
+ !$omp atomic
+ t_rww(2) = t_rww(2) + (wtime()-tw0)
 
 #endif
 
@@ -555,31 +621,41 @@ subroutine finish_celldens_exchange(irequestrecv,xsendbuf,dtype)
  type(celldens), intent(in)    :: xsendbuf
  integer,        intent(inout) :: dtype
 #ifdef MPI
- integer                            :: newproc,iproc
+ integer                            :: iproc
+ logical                            :: cancelled
  integer                            :: mpierr
  integer                            :: status(MPI_STATUS_SIZE)
+ real(kind=8)                       :: tw0
+
+ tw0 = wtime()
 
 !
-!--each processor do a dummy send to next processor to clear the last remaining receive
-!  (we know the receive has been posted for this, so use RSEND)
+!--Every cell this rank expected has been received and counted, so the
+!  persistent receives still posted can never match anything. Cancel them
+!  locally. This used to be done by having every thread send a full-size
+!  dummy cell to every rank with MPI_RSEND, which costs threads x ranks
+!  blocking sends per exchange and is erroneous if the matching receive is
+!  not yet posted.
 !
- do newproc=0,nprocs-1
-    call MPI_RSEND(xsendbuf,1,dtype,newproc,1,comm_cellexchange,mpierr)
- enddo
-
-!
-!--sync all threads here
-!
- call barrier_mpi
-
-!--free request handle
  do iproc=1,nprocs
+    call MPI_CANCEL(irequestrecv(iproc),mpierr)
     call MPI_WAIT(irequestrecv(iproc),status,mpierr)
+    call MPI_TEST_CANCELLED(status,cancelled,mpierr)
+    if (.not.cancelled) call fatal('finish_cell_exchange','unexpected cell received after all counts matched')
     call MPI_REQUEST_FREE(irequestrecv(iproc),mpierr)
  enddo
 
+!
+!--no rank may start the next exchange until every rank has cancelled, or a
+!  new cell could match a receive that is about to be cancelled
+!
+ call barrier_mpi
+
 !--free mpi datatype
  call free_mpitype_of_celldens(dtype)
+
+ !$omp atomic
+ t_finish(1) = t_finish(1) + (wtime()-tw0)
 
 #endif
 end subroutine finish_celldens_exchange
@@ -593,31 +669,41 @@ subroutine finish_cellforce_exchange(irequestrecv,xsendbuf,dtype)
  type(cellforce), intent(in)    :: xsendbuf
  integer,         intent(inout) :: dtype
 #ifdef MPI
- integer                            :: newproc,iproc
+ integer                            :: iproc
+ logical                            :: cancelled
  integer                            :: mpierr
  integer                            :: status(MPI_STATUS_SIZE)
+ real(kind=8)                       :: tw0
+
+ tw0 = wtime()
 
 !
-!--each processor do a dummy send to next processor to clear the last remaining receive
-!  (we know the receive has been posted for this, so use RSEND)
+!--Every cell this rank expected has been received and counted, so the
+!  persistent receives still posted can never match anything. Cancel them
+!  locally. This used to be done by having every thread send a full-size
+!  dummy cell to every rank with MPI_RSEND, which costs threads x ranks
+!  blocking sends per exchange and is erroneous if the matching receive is
+!  not yet posted.
 !
- do newproc=0,nprocs-1
-    call MPI_RSEND(xsendbuf,1,dtype,newproc,0,comm_cellexchange,mpierr)
- enddo
-
-!
-!--sync all threads here
-!
- call barrier_mpi
-
-!--free request handle
  do iproc=1,nprocs
+    call MPI_CANCEL(irequestrecv(iproc),mpierr)
     call MPI_WAIT(irequestrecv(iproc),status,mpierr)
+    call MPI_TEST_CANCELLED(status,cancelled,mpierr)
+    if (.not.cancelled) call fatal('finish_cell_exchange','unexpected cell received after all counts matched')
     call MPI_REQUEST_FREE(irequestrecv(iproc),mpierr)
  enddo
 
+!
+!--no rank may start the next exchange until every rank has cancelled, or a
+!  new cell could match a receive that is about to be cancelled
+!
+ call barrier_mpi
+
  !--free mpi datatype
  call free_mpitype_of_cellforce(dtype)
+
+ !$omp atomic
+ t_finish(2) = t_finish(2) + (wtime()-tw0)
 
 #endif
 end subroutine finish_cellforce_exchange

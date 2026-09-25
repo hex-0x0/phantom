@@ -242,6 +242,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  use mpimemory,    only:stack_waiting => force_stack_2
  use io_summary,   only:iosumdtr
  use timing,       only:increment_timer,get_timings,itimer_force_local,itimer_force_remote
+ use mpiprof,      only:wtime,t_sendwait,t_compute,t_remote,ncell_local,npart_local,ncalls,&
+                        callrec_np,callrec_t,maxcallrec
  use omputils,     only:omp_thread_num,omp_num_threads
  use eos,          only:iresistive_heating
 
@@ -301,6 +303,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  type(cellforce)           :: cell,xsendbuf,xrecvbuf(nprocs)
  integer                   :: mpitype
  logical                   :: remote_export(nprocs),do_export,idone(nprocs),thread_complete(omp_num_threads)
+ real(kind=8)              :: tw0
  integer                   :: irequestsend(nprocs),irequestrecv(nprocs)
  integer                   :: ncomplete_mpi
 
@@ -401,8 +404,9 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  rhomax        = 0.
 #endif
 
+ ncalls(2) = ncalls(2) + 1
  if (mpi) then
-    call reset_stacks
+    call reset_stacks(int(reduceall_mpi('+',count(leaf_is_active(1:ncells) > 0))))
     call reset_cell_counters(cell_counters)
  endif
 
@@ -451,6 +455,8 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 !$omp private(idone) &
 !$omp private(nneigh) &
 !$omp private(mpitype) &
+!$omp private(tw0) &
+!$omp shared(t_sendwait,t_compute,t_remote,ncell_local,npart_local,ncalls,callrec_np,callrec_t) &
 !$omp shared(dens) &
 !$omp shared(metrics) &
 !$omp shared(apr_level) &
@@ -536,21 +542,37 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
        if (do_export) then
           if (stack_waiting%n > 0) then
              !--wait for broadcast to complete, continue to receive whilst doing so
+             tw0 = wtime()
              idone(:) = .false.
              do while(.not.all(idone))
                 call check_send_finished(irequestsend,idone)
                 call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
              enddo
+             !$omp atomic
+             t_sendwait(2) = t_sendwait(2) + (wtime()-tw0)
           endif
           call reserve_stack(stack_waiting,cell%waiting_index)
           call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype)  ! send to remote
        endif
     endif
 
+    tw0 = wtime()
     call compute_cell(cell,listneigh,nneigh,Bevol,xyzh,vxyzu,fxyzu, &
                       iphase,divcurlv,divcurlB,alphaind,eta_nimhd,eos_vars, &
                       dustfrac,dustprop,fxyz_dragold,gradh,ibinnow_m1,ibin_wake,stressmax,xyzcache,&
                       rad,radprop,dens,metrics,apr_level,dt)
+    !$omp atomic
+    t_compute(2) = t_compute(2) + (wtime()-tw0)
+    !$omp atomic
+    ncell_local(2) = ncell_local(2) + 1
+    !$omp atomic
+    npart_local(2) = npart_local(2) + cell%npcell
+    if (ncalls(2) <= maxcallrec) then
+       !$omp atomic
+       callrec_np(ncalls(2)) = callrec_np(ncalls(2)) + cell%npcell
+       !$omp atomic
+       callrec_t(ncalls(2)) = callrec_t(ncalls(2)) + (wtime()-tw0)
+    endif
 
     if (do_export) then
        call write_cell(stack_waiting,cell)
@@ -578,11 +600,14 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
  !$omp enddo
 
  if (stack_waiting%n > 0) then
+    tw0 = wtime()
     idone(:) = .false.
     do while(.not.all(idone))
        call check_send_finished(irequestsend,idone)
        call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
     enddo
+    !$omp atomic
+    t_sendwait(2) = t_sendwait(2) + (wtime()-tw0)
  endif
 
  if (mpi) then
@@ -602,6 +627,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     !$omp do schedule(runtime)
     over_remote: do i = 1,stack_remote%n
        cell = get_cell(stack_remote,i)
+       tw0 = wtime()
 
        call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,maxcellcache, &
                                getj=.true.,f=cell%fgrav,&
@@ -611,15 +637,20 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
                          iphase,divcurlv,divcurlB,alphaind,eta_nimhd,eos_vars, &
                          dustfrac,dustprop,fxyz_dragold,gradh,ibinnow_m1,ibin_wake,stressmax,xyzcache,&
                          rad,radprop,dens,metrics,apr_level,dt)
+       !$omp atomic
+       t_remote(2) = t_remote(2) + (wtime()-tw0)
 
        remote_export = .false.
        remote_export(cell%owner+1) = .true. ! use remote_export array to send back to the owner
 
+       tw0 = wtime()
        idone(:) = .false.
        do while(.not.all(idone))
           call check_send_finished(irequestsend,idone)
           call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
        enddo
+       !$omp atomic
+       t_sendwait(2) = t_sendwait(2) + (wtime()-tw0)
 
        call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype) ! send the cell back to owner
 
@@ -630,11 +661,14 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
     stack_remote%n = 0
     !$omp end single
 
+    tw0 = wtime()
     idone(:) = .false.
     do while(.not.all(idone))
        call check_send_finished(irequestsend,idone)
        call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
     enddo
+    !$omp atomic
+    t_sendwait(2) = t_sendwait(2) + (wtime()-tw0)
 
  endif igot_remote
 

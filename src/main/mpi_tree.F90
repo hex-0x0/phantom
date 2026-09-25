@@ -30,6 +30,7 @@ module mpitree
 
  public :: get_group_cofm
  public :: reduce_group
+ public :: reduce_group_sum_vec
 
  public :: tree_sync
  public :: tree_bcast
@@ -211,6 +212,25 @@ end function reduce_group_int
 !  synchronize the global tree, placing nodes in the correct position
 !+
 !----------------------------------------------------------------
+!--------------------------------------------------------------------------
+!+
+!  sum an array over the tasks sharing a node at this level of the global
+!  tree, in one reduction
+!+
+!--------------------------------------------------------------------------
+subroutine reduce_group_sum_vec(x,level)
+ real,    intent(inout) :: x(:)
+ integer, intent(in)    :: level
+#ifdef MPI
+ real    :: xg(size(x))
+ integer :: mpierr
+
+ call MPI_ALLREDUCE(x,xg,size(x),MPI_REAL8,MPI_SUM,comm_cofm(level+1),mpierr)
+ x = xg
+#endif
+
+end subroutine reduce_group_sum_vec
+
 subroutine tree_sync(node_in,n_in,node_synced,n_synced,ifirstingroup,level)
  use dtypekdtree, only:get_mpitype_of_kdnode,kdnode
 

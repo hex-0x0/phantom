@@ -55,7 +55,14 @@ subroutine allocate_memory(ntot, part_only,reallocation)
     realloc_ = .false.
  endif
 
- n = int(min(nprocs,4) * ntot / nprocs)
+ ! headroom multiplier on the fair share (ntot/nprocs) so a rank can absorb
+ ! load imbalance from domain decomposition without npartnew > maxp aborting;
+ ! clamped at nprocs so we never allocate more than the whole dataset per rank.
+ ! min(nprocs,4) was too tight for clustered, self-gravitating problems, where
+ ! the dense core concentrates far more than 4x the fair share onto the ranks
+ ! that own it -- this is what made 'npartnew > maxp' inevitable at scale
+ ! (e.g. maxp=81,160 at 32 ranks, died one particle past the limit).
+ n = int(min(nprocs,16) * ntot / nprocs)
 
  if (nbytes_allocated > 0.0 .and. (n <= maxp .and. .not.realloc_)) then
     !
