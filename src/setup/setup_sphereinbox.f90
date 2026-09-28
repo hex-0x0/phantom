@@ -517,18 +517,18 @@ end subroutine set_binary_perturbation
 !+
 !----------------------------------------------------------------
 subroutine set_turbulent_velocity_field(npart,xyzh,vxyzu,cs_sphere,npartsphere)
- use centreofmass, only:reset_centreofmass
+ use centreofmass, only:get_centreofmass
  use velfield,  only:set_velfield_from_cubes
  use datafiles, only:find_phantom_datafile
  use io,        only:fatal
  use boundary,  only:xmax
  integer, intent(in)    :: npart
- real,    intent(inout) :: xyzh(:,:)
+ real,    intent(in)    :: xyzh(:,:)
  real,    intent(out)   :: vxyzu(:,:)
  real,    intent(in)    :: cs_sphere
  integer, intent(inout) :: npartsphere
  integer :: i,ierr
- real :: v2i,rmsmach,turbfac
+ real :: v2i,rmsmach,turbfac,xcom(3),vcom(3)
  character(len=120) :: filex,filey,filez
  character(len=20), parameter :: filevx = 'cube_v1.dat'
  character(len=20), parameter :: filevy = 'cube_v2.dat'
@@ -552,10 +552,13 @@ subroutine set_turbulent_velocity_field(npart,xyzh,vxyzu,cs_sphere,npartsphere)
 
  ! remove the net velocity of the field sampled onto the sphere. The cubes have
  ! zero mean over the whole cube but not over the sphere, and a bulk drift is
- ! not turbulence. Only the sphere particles (the first npartsphere) are reset,
- ! so the medium stays at rest; the random sphere is placed symmetrically about
- ! the origin, so positions do not move
- call reset_centreofmass(npartsphere,xyzh,vxyzu)
+ ! not turbulence. Only the sphere particles (the first npartsphere) are
+ ! changed, so the medium stays at rest, and only velocities: moving positions
+ ! would misalign the sphere with the medium, or push particles out of the box
+ call get_centreofmass(xcom,vcom,npartsphere,xyzh,vxyzu)
+ do i = 1,npartsphere
+    vxyzu(1:3,i) = vxyzu(1:3,i) - vcom
+ enddo
 
  rmsmach = 0.0
  print*, 'Turbulence being set by user'
