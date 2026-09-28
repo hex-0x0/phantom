@@ -517,17 +517,18 @@ end subroutine set_binary_perturbation
 !+
 !----------------------------------------------------------------
 subroutine set_turbulent_velocity_field(npart,xyzh,vxyzu,cs_sphere,npartsphere)
+ use centreofmass, only:reset_centreofmass
  use velfield,  only:set_velfield_from_cubes
  use datafiles, only:find_phantom_datafile
  use io,        only:fatal
  use boundary,  only:xmax
  integer, intent(in)    :: npart
- real,    intent(in)    :: xyzh(:,:)
+ real,    intent(inout) :: xyzh(:,:)
  real,    intent(out)   :: vxyzu(:,:)
  real,    intent(in)    :: cs_sphere
  integer, intent(inout) :: npartsphere
  integer :: i,ierr
- real :: v2i,rmsmach,turbfac,vcom(3)
+ real :: v2i,rmsmach,turbfac
  character(len=120) :: filex,filey,filez
  character(len=20), parameter :: filevx = 'cube_v1.dat'
  character(len=20), parameter :: filevy = 'cube_v2.dat'
@@ -549,19 +550,12 @@ subroutine set_turbulent_velocity_field(npart,xyzh,vxyzu,cs_sphere,npartsphere)
                               filex,filey,filez,1.,r_sphere,.false.,ierr)
  if (ierr /= 0) call fatal('setup','error setting up velocity field on clouds')
 
- ! remove the net (bulk) velocity of the turbulent field sampled onto the sphere;
- ! only the mean is subtracted, the fluctuating (turbulent) part is kept. Without this
- ! the initial linear momentum is small but non-zero and the relative conservation
- ! check in checkconserved aborts the run after only modest (absolute) momentum drift
- vcom = 0.
- do i = 1,npartsphere
-    vcom = vcom + vxyzu(1:3,i)
- enddo
- vcom = vcom/real(npartsphere) ! particles have equal mass
- do i = 1,npartsphere
-    vxyzu(1:3,i) = vxyzu(1:3,i) - vcom
- enddo
- print "(a,3(es10.3,1x))",' Removed net turbulent velocity (code units): ',vcom
+ ! remove the net velocity of the field sampled onto the sphere. The cubes have
+ ! zero mean over the whole cube but not over the sphere, and a bulk drift is
+ ! not turbulence. Only the sphere particles (the first npartsphere) are reset,
+ ! so the medium stays at rest; the random sphere is placed symmetrically about
+ ! the origin, so positions do not move
+ call reset_centreofmass(npartsphere,xyzh,vxyzu)
 
  rmsmach = 0.0
  print*, 'Turbulence being set by user'
