@@ -1178,6 +1178,10 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  else ! split this node and add children to stack
     iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
     xpivot = xyzcofm(iaxis)          ! split on centre of mass
+    ! the global levels decide which task owns which particles, so split those
+    ! so as to share the work evenly rather than at the centre of mass
+    if (mpi .and. global_build) call get_balanced_pivot(iaxis,xmini(iaxis),xmaxi(iaxis),&
+                                                         inoderange(1,nnode),npnode,level,xpivot)
 
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
@@ -1615,6 +1619,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  use io,       only:fatal,id
  use part,     only:gravity
  use kernel,   only:radkern
+ use mpiprof,  only:nopen_geom,nopen_hj,nopen_grav
  type(kdnode), intent(in)  :: node(:) !ncellsmax+1)
  integer,      intent(in)  :: ixyzcachesize
  real,         intent(in)  :: xpos(3)
@@ -1636,6 +1641,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  real :: xoffset,yoffset,zoffset,tree_acc2
  logical :: open_tree_node
  logical :: global_walk
+ integer :: kprof
 #ifdef GRAVITY
  real :: quads(6)
  real :: dr,totmass_node
@@ -1682,13 +1688,28 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
        rcut  = max(rcuti,rcutj)
     endif
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
-    if (gravity) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
+    ! only open nodes on the gravity criterion when this walk computes gravity.
+    ! gravity is a compile-time flag, so testing it alone also opened nodes for
+    ! the density pass and every pure neighbour search, and on the global tree
+    ! that exported cells to ranks that could not hold any of their neighbours.
+    if (get_f) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
     if_open_node: if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (leaf_is_active(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
           if_global_walk: if (global_walk) then
              ! id is stored in cellatid (passed through into leaf_is_active) as id + 1
              if (leaf_is_active(n) /= (id + 1)) then
                 remote_export(leaf_is_active(n)) = .true.
+                kprof = merge(2,1,get_hj)
+                if (r2 < (xsizei + xsizej + rcuti)**2) then
+                   !$omp atomic
+                   nopen_geom(kprof) = nopen_geom(kprof) + 1
+                elseif (r2 < rcut2) then
+                   !$omp atomic
+                   nopen_hj(kprof) = nopen_hj(kprof) + 1
+                else
+                   !$omp atomic
+                   nopen_grav(kprof) = nopen_grav(kprof) + 1
+                endif
              endif
           else
              call cache_neighbours(nneigh,n,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
@@ -2509,6 +2530,101 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
 
 end subroutine revtree
 
+!--------------------------------------------------------------------------
+!+
+!  Choose where to split a node of the global tree, i.e. how to divide
+!  particles between two groups of MPI tasks.
+!
+!  Splitting at the centre of mass balances neither the particle count nor
+!  the work. With individual timesteps the work sits in the few per cent of
+!  particles in the deepest bins, usually one dense region, and a split at
+!  the centre of mass of everything can leave most of it on one side: on a
+!  collapsing core, one of two tasks held 84 per cent of the active particles
+!  in the substeps that dominated the run time.
+!
+!  So split at the weighted median along the chosen axis. A particle in bin
+!  ibin is active on a fraction 2**(ibin-nbinmax) of substeps, so 2**ibin is
+!  its expected share of the work. That changes slowly from step to step,
+!  which keeps the split steady and the particle traffic between tasks low.
+!  Balancing on work alone would put all of a large, almost inactive envelope
+!  on a few tasks and could overflow maxp there, so a fraction fcount of the
+!  weight is plain particle count. That caps any task at 1/(nprocs*fcount) of
+!  the particles.
+!
+!  The centre of mass is kept whenever it is already within tolbal of an
+!  even split, so problems it balanced well keep exactly the decomposition
+!  they had (symmetric set-ups, for instance, stay symmetric). Otherwise the
+!  median is found with two rounds of a histogram summed over the group,
+!  i.e. two reductions per level.
+!+
+!--------------------------------------------------------------------------
+subroutine get_balanced_pivot(iaxis,xlo,xhi,i1,npnode,level,xpivot)
+ use dim,     only:ind_timesteps,maxpsph
+ use part,    only:ibin
+ use mpitree, only:reduce_group_sum_vec
+ integer, intent(in)    :: iaxis,i1,npnode,level
+ real,    intent(in)    :: xlo,xhi
+ real,    intent(inout) :: xpivot   ! in: fallback, out: chosen split
+ integer, parameter :: nhist = 128, nround = 2
+ real,    parameter :: fcount = 0.2, tolbal = 0.05
+ real    :: buf(6+2*nhist)
+ real    :: lo,hi,dx,xi,wi,wtot,ntot,cum,frac,xcom
+ integer :: iround,j,k,ip
+
+ lo = xlo
+ hi = xhi
+ xcom = xpivot
+ if (.not.(hi > lo)) return
+
+ do iround=1,nround
+    buf(:) = 0.
+    dx = (hi - lo)/nhist
+    do j=i1,i1+npnode-1
+       ip = abs(inodeparts(j))
+       xi = treecache(iaxis,j)
+       wi = 1.
+       if (ind_timesteps .and. ip <= maxpsph) wi = scale(1.,int(ibin(ip)))   ! 2**ibin, exactly
+       buf(1) = buf(1) + wi                 ! total work
+       buf(2) = buf(2) + 1.                 ! total count
+       if (iround == 1 .and. xi < xcom) then
+          buf(5+2*nhist) = buf(5+2*nhist) + wi   ! below the centre of mass
+          buf(6+2*nhist) = buf(6+2*nhist) + 1.
+       endif
+       if (xi < lo) then
+          buf(3) = buf(3) + wi              ! below the window
+          buf(4) = buf(4) + 1.
+       elseif (xi <= hi) then
+          k = min(nhist,int((xi - lo)/dx) + 1)
+          buf(4+k)       = buf(4+k)       + wi
+          buf(4+nhist+k) = buf(4+nhist+k) + 1.
+       endif
+    enddo
+    call reduce_group_sum_vec(buf,level)
+
+    wtot = buf(1)
+    ntot = buf(2)
+    if (wtot <= 0. .or. ntot <= 0.) return   ! nothing to balance, keep the fallback
+    if (iround == 1) then
+       ! keep the centre of mass if it is already close enough to even
+       cum = (1. - fcount)*buf(5+2*nhist)/wtot + fcount*buf(6+2*nhist)/ntot
+       if (abs(cum - 0.5) <= tolbal) return
+    endif
+
+    cum = (1. - fcount)*buf(3)/wtot + fcount*buf(4)/ntot
+    do k=1,nhist
+       frac = (1. - fcount)*buf(4+k)/wtot + fcount*buf(4+nhist+k)/ntot
+       if (cum + frac >= 0.5) exit
+       cum = cum + frac
+    enddo
+    k  = min(k,nhist)
+    hi = lo + k*dx
+    lo = lo + (k-1)*dx
+ enddo
+
+ xpivot = 0.5*(lo + hi)
+
+end subroutine get_balanced_pivot
+
 !--------------------------------------------------------------------------------
 !+
 !  Routine to build the global level tree
@@ -2524,6 +2640,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
                         iamtype,maxphase,maxp,aprmassoftype,apr_level,ihsoft
  use timing,       only:increment_timer,get_timings,itimer_balance
  use dim,          only:ind_timesteps
+ use mpiprof,      only:refine_min,refine_max,npart_sum,nbuild,t_tglobal,t_tlocal,t_trefine,t_tbal,wtime
 
  type(kdnode),    intent(out)   :: nodeglobal(:)    ! ncellsmax+1
  type(kdnode),    intent(out)   :: node(:)          ! ncellsmax+1
@@ -2555,12 +2672,14 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
  integer                           :: npnode
  logical                           :: wassplit,sinktree
  real(kind=4)                      :: t1,t2,tcpu1,tcpu2
+ real(kind=8)                      :: tp0,tp1
 
  sinktree = .false.
  if (present(nptmass).and.present(xyzmh_ptmass)) sinktree=.true.
  parent = 0
  iself = irootnode
  leaf_is_active = 0
+ tp0 = wtime()
 
  ! root is level 0
  globallevel = int(ceiling(log(real(nprocs)) / log(2.0)))
@@ -2638,6 +2757,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     call get_timings(t2,tcpu2)
     if (sinktree) ibelong(maxpsph+1:maxpsph+nptmass) = int(reduceall_mpi("max", ibelong(maxpsph+1:maxpsph+nptmass)))
     call increment_timer(itimer_balance,t2-t1,tcpu2-tcpu1)
+    t_tbal = t_tbal + (t2-t1)
     ! move particles from old array
     ! this is a waste of time, but maintains compatibility
     npnode = 0
@@ -2701,6 +2821,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     endif
 
  enddo levels
+ tp1 = wtime(); t_tglobal = t_tglobal + (tp1-tp0); tp0 = tp1
 
  ! local tree
  if (sinktree) then
@@ -2709,8 +2830,13 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     call maketree(node,xyzh,np,leaf_is_active,ncells,apr_tree,refinelevels)
  endif
 
+ tp1 = wtime(); t_tlocal = t_tlocal + (tp1-tp0); tp0 = tp1
  ! tree refinement
  refinelevels = int(reduceall_mpi('min',refinelevels),kind=kind(refinelevels))
+ refine_min = min(refine_min,refinelevels)
+ refine_max = max(refine_max,refinelevels)
+ npart_sum = npart_sum + np
+ nbuild = nbuild + 1
  roffset_prev = 1
 
  irefine = 0
@@ -2757,6 +2883,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
 !  The index up to which the local tree is copied to the global tree
  irefine = 2*roffset-1
 
+ t_trefine = t_trefine + (wtime()-tp0)
  ! cellatid is zero by default
  cellatid = 0
  do i = 1,nprocs

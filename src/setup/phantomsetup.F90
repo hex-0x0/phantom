@@ -43,6 +43,7 @@ program phantomsetup
  use fileutils,       only:strip_extension
  use gravwaveutils,   only:calc_gravitwaves
  use systemutils,     only:get_command_option
+ use spherical,       only:iseed_mc
  use metric,          only:update_metric
 #ifdef KROME
  use krome_interface, only:write_KromeSetupFile
@@ -93,6 +94,11 @@ program phantomsetup
 !
  n_alloc = get_command_option('maxp',default=int(maxp_alloc))
  call allocate_memory(n_alloc, part_only=.true.)
+!
+!--seed for random particle placement in spheres (--seed=N), so that the same
+!  set-up can be drawn as an independent realisation
+!
+ iseed_mc = -abs(int(get_command_option('seed',default=abs(iseed_mc))))
 
  call set_default_options
 !

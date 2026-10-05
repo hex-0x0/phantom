@@ -55,7 +55,10 @@ subroutine allocate_memory(ntot, part_only,reallocation)
     realloc_ = .false.
  endif
 
- n = int(min(nprocs,4) * ntot / nprocs)
+ ! allow a task up to 16 times its fair share of particles (or all of them).
+ ! In self-gravitating collapse the dense region can put more than 4 times
+ ! the fair share on the tasks that own it, which aborted with npartnew > maxp
+ n = int(min(nprocs,16) * ntot / nprocs)
 
  if (nbytes_allocated > 0.0 .and. (n <= maxp .and. .not.realloc_)) then
     !

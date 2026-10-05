@@ -40,7 +40,7 @@ contains
 subroutine init_conservation_checks()
  use eos,         only:icooling,ieos,ipdv_heating,ishock_heating,iresistive_heating
  use options,     only:use_dustfrac,iexternalforce
- use dim,         only:mhd,maxvxyzu,periodic,inject_parts,use_apr
+ use dim,         only:mhd,maxvxyzu,periodic,inject_parts,use_apr,driving
  use part,        only:iboundary,npartoftype
  use boundary_dyn,only:dynamic_bdy
  !
@@ -51,9 +51,10 @@ subroutine init_conservation_checks()
                           icooling==0 .and. ipdv_heating==1 .and. ishock_heating==1 &
                           .and. (.not.mhd .or. iresistive_heating==1))
  !
- ! code should conserve momentum unless boundary particles are employed
+ ! code should conserve momentum unless boundary particles are employed,
+ ! or momentum is put in from outside (external forces, turbulent driving)
  !
- if (iexternalforce/=0) then
+ if (iexternalforce/=0 .or. driving) then
     should_conserve_momentum = .false.
  else
     should_conserve_momentum = (npartoftype(iboundary)==0)
@@ -89,17 +90,20 @@ end subroutine init_conservation_checks
 !  and stop if it is too large
 !+
 !----------------------------------------------------------------
-subroutine check_conservation_error(val,ref,tol,label,decrease)
+subroutine check_conservation_error(val,ref,tol,label,decrease,scale)
  use io,             only:error,fatal,iverbose
  use options,        only:iexternalforce
  use externalforces, only:iext_corot_binary
  real,             intent(in) :: val,ref,tol
  character(len=*), intent(in) :: label
  logical,          intent(in), optional :: decrease
- real :: err
+ real,             intent(in), optional :: scale  ! natural size of the quantity
+ real :: err,refscale
 
- if (abs(ref) > 1.e-3) then
-    err = (val - ref)/abs(ref)
+ refscale = abs(ref)
+ if (present(scale)) refscale = max(refscale,scale)
+ if (refscale > 1.e-3) then
+    err = (val - ref)/refscale
  else
     err = (val - ref)
  endif
@@ -128,14 +132,19 @@ end subroutine check_conservation_error
 !  and stop if it is too large
 !+
 !----------------------------------------------------------------
-subroutine check_conservation_errors(totmom,angtot,etot,mdust,mtot,hdivBonB_ave,hdivBonB_max,np_e_eq_0,np_cs_eq_0)
+subroutine check_conservation_errors(totmom,angtot,etot,ekin,mdust,mtot,hdivBonB_ave,hdivBonB_max,np_e_eq_0,np_cs_eq_0)
  use io,   only:id,master,iverbose,warning
  use part, only:ndustsmall,massoftype,igas,mhd
- real,            intent(in) :: totmom,angtot,etot,mdust(:),mtot,hdivBonB_ave,hdivBonB_max
+ real,            intent(in) :: totmom,angtot,etot,ekin,mdust(:),mtot,hdivBonB_ave,hdivBonB_max
  integer(kind=8), intent(in) :: np_e_eq_0,np_cs_eq_0
  integer :: j
+ real    :: momscale
 
- if (should_conserve_momentum) call check_conservation_error(totmom,totmom_in,1.e-1,'linear momentum')
+ ! momentum error relative to M*v_rms, not to the initial momentum alone:
+ ! a system that starts at rest (totmom_in = 0) would otherwise be held to
+ ! an absolute tolerance in code units
+ momscale = sqrt(2.*mtot*max(ekin,0.))
+ if (should_conserve_momentum) call check_conservation_error(totmom,totmom_in,1.e-1,'linear momentum',scale=momscale)
  if (should_conserve_angmom)   call check_conservation_error(angtot,angtot_in,1.e-1,'angular momentum')
  if (should_conserve_energy)   call check_conservation_error(etot,etot_in,1.e-1,'energy')
  if (should_conserve_dustmass) then
