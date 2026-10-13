@@ -5,6 +5,7 @@
 ! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 program phantom
+ use mpiprof, only:write_mpiprof
 !
 ! The Phantom SPH code, by Daniel Price.
 !
@@ -72,6 +73,7 @@ program phantom
  call startrun(infile,logfile,evfile,dumpfile)
  call evol(infile,logfile,evfile,dumpfile)
  if (id==master) call endrun()
+ call write_mpiprof()
 
  call finalise_mpi()
 
