@@ -1928,6 +1928,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
                         iamtype,maxphase,maxp,aprmassoftype,apr_level,ihsoft
  use timing,       only:increment_timer,get_timings,itimer_balance
  use dim,          only:ind_timesteps
+ use mpiprof,      only:refine_min,refine_max,npart_sum,nbuild,t_tglobal,t_tlocal,t_trefine,t_tbal,wtime
 
  type(kdnode),    intent(out)   :: nodeglobal(:)    ! ncellsmax+1
  type(kdnode),    intent(out)   :: node(:)          ! ncellsmax+1
@@ -1959,12 +1960,14 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
  integer                           :: npnode
  logical                           :: wassplit,sinktree
  real(kind=4)                      :: t1,t2,tcpu1,tcpu2
+ real(kind=8)                      :: tp0,tp1
 
  sinktree = .false.
  if (present(nptmass).and.present(xyzmh_ptmass)) sinktree=.true.
  parent = 0
  iself = irootnode
  leaf_is_active = 0
+ tp0 = wtime()
 
  ! root is level 0
  globallevel = int(ceiling(log(real(nprocs)) / log(2.0)))
@@ -2042,6 +2045,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     call get_timings(t2,tcpu2)
     if (sinktree) ibelong(maxpsph+1:maxpsph+nptmass) = int(reduceall_mpi("max", ibelong(maxpsph+1:maxpsph+nptmass)))
     call increment_timer(itimer_balance,t2-t1,tcpu2-tcpu1)
+    t_tbal = t_tbal + (t2-t1)
     ! move particles from old array
     ! this is a waste of time, but maintains compatibility
     npnode = 0
@@ -2105,6 +2109,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     endif
 
  enddo levels
+ tp1 = wtime(); t_tglobal = t_tglobal + (tp1-tp0); tp0 = tp1
 
  ! local tree
  if (sinktree) then
@@ -2113,6 +2118,7 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     call maketree(node,xyzh,np,leaf_is_active,ncells,apr_tree,refinelevels)
  endif
 
+ tp1 = wtime(); t_tlocal = t_tlocal + (tp1-tp0); tp0 = tp1
  ! tree refinement: the top levels of the local trees are copied into the global tree.
  ! Limit the depth so the global tree fits in nodeglobal, which is the size of the local
  ! tree, so that memory per task does not grow with the total number of particles.
@@ -2121,6 +2127,10 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
     refinelevels = refinelevels - 1
  enddo
  refinelevels = int(reduceall_mpi('min',refinelevels),kind=kind(refinelevels))
+ refine_min = min(refine_min,refinelevels)
+ refine_max = max(refine_max,refinelevels)
+ npart_sum = npart_sum + np
+ nbuild = nbuild + 1
  roffset_prev = 1
 
  irefine = 0
@@ -2166,6 +2176,8 @@ subroutine maketreeglobal(nodeglobal,node,nodemap,globallevel,refinelevels,xyzh,
  enddo
 !  The index up to which the local tree is copied to the global tree
  irefine = 2*roffset-1
+
+ t_trefine = t_trefine + (wtime()-tp0)
 
  ! cellatid is zero by default
  cellatid = 0

@@ -537,6 +537,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  use io,       only:fatal,id
  use part,     only:gravity
  use kernel,   only:radkern
+ use mpiprof,  only:nopen_geom,nopen_hj,nopen_grav
  type(kdnode), intent(in)  :: node(:) !ncellsmax+1)
  integer,      intent(in)  :: ixyzcachesize
  real,         intent(in)  :: xpos(3)
@@ -558,6 +559,7 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
  real :: xoffset,yoffset,zoffset,tree_acc2
  logical :: open_tree_node
  logical :: global_walk
+ integer :: kprof
 #ifdef GRAVITY
  real :: quads(6)
  real :: dr,totmass_node
@@ -612,6 +614,17 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
              ! id is stored in cellatid (passed through into leaf_is_active) as id + 1
              if (leaf_is_active(n) /= (id + 1)) then
                 remote_export(leaf_is_active(n)) = .true.
+                kprof = merge(2,1,get_hj)
+                if (r2 < (xsizei + xsizej + rcuti)**2) then
+                   !$omp atomic
+                   nopen_geom(kprof) = nopen_geom(kprof) + 1
+                elseif (r2 < rcut2) then
+                   !$omp atomic
+                   nopen_hj(kprof) = nopen_hj(kprof) + 1
+                else
+                   !$omp atomic
+                   nopen_grav(kprof) = nopen_grav(kprof) + 1
+                endif
              endif
           else
              call cache_neighbours(nneigh,n,ixyzcachesize,maxcache,listneigh,xyzcache,xoffset,yoffset,zoffset)
