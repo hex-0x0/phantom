@@ -17,7 +17,7 @@ module checkconserved
 !
 ! :Dependencies: boundary_dyn, dim, eos, externalforces, io, options, part
 !
- use dim,            only:maxdusttypes,use_apr,mhd,periodic,inject_parts
+ use dim,            only:maxdusttypes,use_apr,mhd,periodic,inject_parts,driving
  use eos,            only:eos_conserves_energy
  use options,        only:use_dustfrac,iexternalforce
  use part,           only:iboundary,npartoftype,ndustsmall,massoftype,igas
@@ -50,9 +50,10 @@ subroutine init_conservation_checks()
  !
  should_conserve_energy = eos_conserves_energy()
  !
- ! code should conserve momentum unless boundary particles are employed
+ ! code should conserve momentum unless boundary particles are employed,
+ ! or momentum is put in from outside (external forces, turbulent driving)
  !
- if (iexternalforce/=0) then
+ if (iexternalforce/=0 .or. driving) then
     should_conserve_momentum = .false.
  else
     should_conserve_momentum = (npartoftype(iboundary)==0)
