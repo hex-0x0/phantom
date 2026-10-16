@@ -41,6 +41,7 @@ module mpibalance
 #endif
  integer, allocatable :: nsent(:),nexpect(:),nrecv(:)
  integer, allocatable :: countrequest(:)
+ integer, allocatable :: countsendrequest(:)
 
 contains
 
@@ -56,6 +57,7 @@ subroutine allocate_balance_arrays()
  call allocate_array('nexpect',     nexpect,     nprocs)
  call allocate_array('nrecv',       nrecv,       nprocs)
  call allocate_array('countrequest',countrequest,nprocs)
+ call allocate_array('countsendrequest',countsendrequest,nprocs)
 
 end subroutine allocate_balance_arrays
 
@@ -70,6 +72,7 @@ subroutine deallocate_balance_arrays()
  if (allocated(nexpect     )) deallocate(nexpect     )
  if (allocated(nrecv       )) deallocate(nrecv       )
  if (allocated(countrequest)) deallocate(countrequest)
+ if (allocated(countsendrequest)) deallocate(countsendrequest)
 
 end subroutine deallocate_balance_arrays
 
@@ -335,8 +338,8 @@ subroutine balance_finish(npart,replace)
  integer, intent(out) :: npart
  logical, intent(in), optional :: replace
  integer             :: newproc
- integer             :: sendrequest !dummy
  logical, parameter  :: iamcomplete = .true.
+ logical             :: cancelled
  logical             :: doreplace
 
 !
@@ -345,7 +348,10 @@ subroutine balance_finish(npart,replace)
 !
  do newproc=0,nprocs-1
     if (newproc /= id) then
-       call MPI_ISEND(nsent(newproc+1),1,MPI_INTEGER4,newproc,0,comm_balancecount,sendrequest,mpierr)
+       call MPI_ISEND(nsent(newproc+1),1,MPI_INTEGER4,newproc,0,comm_balancecount, &
+                      countsendrequest(newproc+1),mpierr)
+    else
+       countsendrequest(newproc+1) = MPI_REQUEST_NULL
     endif
  enddo
 
@@ -365,20 +371,30 @@ subroutine balance_finish(npart,replace)
 
  call MPI_BARRIER(MPI_COMM_WORLD,mpierr)
 !
-!--each processor do a dummy send to next processor to clear the last remaining receive
-!  (we know the receive has been posted for this, so use RSEND)
+!--every task has received every count by now, so the count sends are done.
+!  They were previously all issued on one request variable and never
+!  completed, leaking nprocs-1 requests per call.
 !
- newproc = mod(id+1,nprocs)
- call MPI_RSEND(xsendbuf,0,MPI_DEFAULT_REAL,newproc,0,comm_balance,mpierr)
+ call MPI_WAITALL(nprocs,countsendrequest,MPI_STATUSES_IGNORE,mpierr)
+!
+!--every particle this task expected has arrived, so the persistent receive
+!  can never match again. Cancel it rather than clearing it with a dummy
+!  MPI_RSEND, which is erroneous if the receive is not yet posted.
+!
+ call MPI_CANCEL(irequestrecv(1),mpierr)
+ call MPI_WAIT(irequestrecv(1),status,mpierr)
+ call MPI_TEST_CANCELLED(status,cancelled,mpierr)
+ if (.not.cancelled) call fatal('balance','unexpected particle received after all counts matched')
+ call MPI_REQUEST_FREE(irequestrecv(1),mpierr)
 
  if (iverbose >= 4 .or. (iverbose >= 3 .and. (sum(nsent(1:nprocs)) > 0 .or. sum(nrecv(1:nprocs)) > 0))) then
     print*,'>> balance: thread ',id,' sent:',sum(nsent(1:nprocs)),' received:',sum(nrecv(1:nprocs)),' npart =',npartnew
  endif
+!
+!--no task may start the next balance, which posts a new receive for any
+!  source, until every task has cancelled this one
+!
  call MPI_BARRIER(MPI_COMM_WORLD,mpierr)
-
-!--double check that all receives are complete and free request handle
- call MPI_WAIT(irequestrecv(1),status,mpierr)
- call MPI_REQUEST_FREE(irequestrecv(1),mpierr)
 
  !
  !--update npartoftype

@@ -1186,6 +1186,10 @@ subroutine construct_node(nodeentry, nnode, mymum, level, xmini, xmaxi, npnode, 
  else ! split this node and add children to stack
     iaxis  = maxloc(xmaxi - xmini,1) ! split along longest axis
     xpivot = xyzcofm(iaxis)          ! split on centre of mass
+    ! the global levels decide which task owns which particles, so split those
+    ! so as to share the work evenly rather than at the centre of mass
+    if (mpi .and. global_build) call get_balanced_pivot(iaxis,xmini(iaxis),xmaxi(iaxis),&
+                                                         inoderange(1,nnode),npnode,level,xpivot)
 
     ! create two children nodes and point to them from current node
     ! always use G&R indexing for global tree
@@ -1690,7 +1694,11 @@ subroutine getneigh(node,xpos,xsizei,rcuti,listneigh,nneigh,xyzcache,ixyzcachesi
        rcut  = max(rcuti,rcutj)
     endif
     rcut2 = (xsizei + xsizej + rcut)**2   ! node size + search radius
-    if (gravity) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
+    ! only open nodes on the gravity criterion when this walk computes gravity.
+    ! gravity is a compile-time flag, so testing it alone also opened nodes for
+    ! the density pass and every pure neighbour search, and on the global tree
+    ! that exported cells to ranks that could not hold any of their neighbours.
+    if (get_f) open_tree_node = tree_acc2*r2 < (xsizei + xsizej)**2   ! tree opening criterion for self-gravity
     if_open_node: if ((r2 < rcut2) .or. open_tree_node) then
        if_leaf: if (leaf_is_active(n) /= 0) then ! once we hit a leaf node, retrieve contents into trial neighbour cache
           if_global_walk: if (global_walk) then
@@ -2516,6 +2524,101 @@ subroutine revtree(node, xyzh, leaf_is_active, ncells)
 !$omp end parallel
 
 end subroutine revtree
+
+!--------------------------------------------------------------------------
+!+
+!  Choose where to split a node of the global tree, i.e. how to divide
+!  particles between two groups of MPI tasks.
+!
+!  Splitting at the centre of mass balances neither the particle count nor
+!  the work. With individual timesteps the work sits in the few per cent of
+!  particles in the deepest bins, usually one dense region, and a split at
+!  the centre of mass of everything can leave most of it on one side: on a
+!  collapsing core, one of two tasks held 84 per cent of the active particles
+!  in the substeps that dominated the run time.
+!
+!  So split at the weighted median along the chosen axis. A particle in bin
+!  ibin is active on a fraction 2**(ibin-nbinmax) of substeps, so 2**ibin is
+!  its expected share of the work. That changes slowly from step to step,
+!  which keeps the split steady and the particle traffic between tasks low.
+!  Balancing on work alone would put all of a large, almost inactive envelope
+!  on a few tasks and could overflow maxp there, so a fraction fcount of the
+!  weight is plain particle count. That caps any task at 1/(nprocs*fcount) of
+!  the particles.
+!
+!  The centre of mass is kept whenever it is already within tolbal of an
+!  even split, so problems it balanced well keep exactly the decomposition
+!  they had (symmetric set-ups, for instance, stay symmetric). Otherwise the
+!  median is found with two rounds of a histogram summed over the group,
+!  i.e. two reductions per level.
+!+
+!--------------------------------------------------------------------------
+subroutine get_balanced_pivot(iaxis,xlo,xhi,i1,npnode,level,xpivot)
+ use dim,     only:ind_timesteps,maxpsph
+ use part,    only:ibin
+ use mpitree, only:reduce_group_sum_vec
+ integer, intent(in)    :: iaxis,i1,npnode,level
+ real,    intent(in)    :: xlo,xhi
+ real,    intent(inout) :: xpivot   ! in: fallback, out: chosen split
+ integer, parameter :: nhist = 128, nround = 2
+ real,    parameter :: fcount = 0.2, tolbal = 0.05
+ real    :: buf(6+2*nhist)
+ real    :: lo,hi,dx,xi,wi,wtot,ntot,cum,frac,xcom
+ integer :: iround,j,k,ip
+
+ lo = xlo
+ hi = xhi
+ xcom = xpivot
+ if (.not.(hi > lo)) return
+
+ do iround=1,nround
+    buf(:) = 0.
+    dx = (hi - lo)/nhist
+    do j=i1,i1+npnode-1
+       ip = abs(inodeparts(j))
+       xi = treecache(iaxis,j)
+       wi = 1.
+       if (ind_timesteps .and. ip <= maxpsph) wi = scale(1.,int(ibin(ip)))   ! 2**ibin, exactly
+       buf(1) = buf(1) + wi                 ! total work
+       buf(2) = buf(2) + 1.                 ! total count
+       if (iround == 1 .and. xi < xcom) then
+          buf(5+2*nhist) = buf(5+2*nhist) + wi   ! below the centre of mass
+          buf(6+2*nhist) = buf(6+2*nhist) + 1.
+       endif
+       if (xi < lo) then
+          buf(3) = buf(3) + wi              ! below the window
+          buf(4) = buf(4) + 1.
+       elseif (xi <= hi) then
+          k = min(nhist,int((xi - lo)/dx) + 1)
+          buf(4+k)       = buf(4+k)       + wi
+          buf(4+nhist+k) = buf(4+nhist+k) + 1.
+       endif
+    enddo
+    call reduce_group_sum_vec(buf,level)
+
+    wtot = buf(1)
+    ntot = buf(2)
+    if (wtot <= 0. .or. ntot <= 0.) return   ! nothing to balance, keep the fallback
+    if (iround == 1) then
+       ! keep the centre of mass if it is already close enough to even
+       cum = (1. - fcount)*buf(5+2*nhist)/wtot + fcount*buf(6+2*nhist)/ntot
+       if (abs(cum - 0.5) <= tolbal) return
+    endif
+
+    cum = (1. - fcount)*buf(3)/wtot + fcount*buf(4)/ntot
+    do k=1,nhist
+       frac = (1. - fcount)*buf(4+k)/wtot + fcount*buf(4+nhist+k)/ntot
+       if (cum + frac >= 0.5) exit
+       cum = cum + frac
+    enddo
+    k  = min(k,nhist)
+    hi = lo + k*dx
+    lo = lo + (k-1)*dx
+ enddo
+
+ xpivot = 0.5*(lo + hi)
+
+end subroutine get_balanced_pivot
 
 !--------------------------------------------------------------------------------
 !+

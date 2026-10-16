@@ -182,7 +182,7 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
  real(kind=4)              :: t1,t2,tcpu1,tcpu2
 
  if (mpi) then
-    call reset_stacks
+    call reset_stacks(int(reduceall_mpi('+',nactive_leaves)))
     call reset_cell_counters(cell_counters)
  endif
 

@@ -1658,7 +1658,7 @@ end function count_unused_overrides
 !-------------------------------------------------------------------------
 !+
 !  store the --option=value strings from a list of arguments,
-!  skipping flags used by the programs themselves (--maxp, --nprocsfake)
+!  skipping flags used by the programs themselves (--maxp, --nprocsfake, --seed)
 !+
 !-------------------------------------------------------------------------
 subroutine load_overrides(args)
@@ -1671,7 +1671,7 @@ subroutine load_overrides(args)
     n = 0
     do i=1,size(args)
        if (.not.parse_option_string(args(i),tag,val)) cycle
-       if (tag=='maxp' .or. tag=='nprocsfake') cycle
+       if (tag=='maxp' .or. tag=='nprocsfake' .or. tag=='seed') cycle
        n = n + 1
        if (pass==2) then
           override_tag(n) = tag
