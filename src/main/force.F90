@@ -401,7 +401,7 @@ subroutine force(icall,npart,xyzh,vxyzu,fxyzu,divcurlv,divcurlB,Bevol,dBevol,&
 #endif
 
  if (mpi) then
-    call reset_stacks
+    call reset_stacks(int(reduceall_mpi('+',nactive_leaves)))
     call reset_cell_counters(cell_counters)
  endif
 
