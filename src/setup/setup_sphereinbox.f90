@@ -166,6 +166,12 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
     call set_radiation_and_gas_temperature_equal(npart,vxyzu,rho,rad)
  endif
 
+ ! start the radiation field in equilibrium with the gas
+ if (do_radiation) then
+    call init_rho_from_h()
+    call set_radiation_and_gas_temperature_equal(npart,vxyzu,rho,rad)
+ endif
+
  ! amend .in file as necessary
  call setup_runtime_parameters(fileprefix,t_ff,h_acc_setup)
 
