@@ -89,6 +89,13 @@ module mpiutils
  integer, public :: MPI_DEFAULT_REAL
  integer, public :: comm_cellexchange,comm_cellcount,comm_balance,comm_balancecount
 
+ ! state of the parallel writing of dump files (see start_threadwrite)
+ logical,                 private :: dump_parallel = .false.
+ integer,                 private :: dump_unit = 0
+ integer(kind=8),         private :: dump_hdrsize = 0
+ real(kind=8),            private :: dump_t0 = 0.
+ character(len=512),      private :: dump_target = '', dump_scratch = ''
+
 !
 !--generic interface reduce_mpi
 !
@@ -286,6 +293,20 @@ end subroutine endmyturn
 !--------------------------------------------------------------------
 !+
 !  utility for initialising each thread
+!
+!  The dump file consists of the header written by the master task,
+!  followed by one block per task. By default (PHANTOM_PARDUMP unset
+!  or 1) every task writes its block to a private scratch file at the
+!  same time, and then copies it to its position in the dump file
+!  (given by the sizes of the blocks of the tasks before it), so the
+!  file is the same as if the tasks had appended in turn but the
+!  tasks do not wait for each other.
+!  PHANTOM_PARDUMP=0 gives the tasks writing in turn. The file is first
+!  extended to its final length (PHANTOM_PREEXTEND=0 to skip that), which
+!  makes the concurrent writes on a parallel file system much faster.
+!  PHANTOM_PARDUMP_TIMING=1 prints where the time goes.
+!  The scratch files are placed next to the dump file, or in the
+!  directory given by PHANTOM_DUMPTMP (e.g. /dev/shm).
 !+
 !--------------------------------------------------------------------
 subroutine start_threadwrite(id,iunit,filename)
@@ -297,9 +318,40 @@ subroutine start_threadwrite(id,iunit,filename)
  integer,          intent(in) :: id, iunit
  character(len=*), intent(in) :: filename
  integer :: nowgo,ierr
+#ifdef MPI
+ integer :: nprocs_mpi
+ integer(kind=8) :: hdrsize
+ character(len=256) :: tmpdir
+#endif
 
  if (iverbose >= 3) print *,id,' : starting write...'
  nowgo = 0
+#ifdef MPI
+ call MPI_COMM_SIZE(MPI_COMM_WORLD,nprocs_mpi,mpierr)
+ if (read_pardump() .and. nprocs_mpi > 1) then
+    dump_parallel = .true.
+    dump_target = trim(filename)
+    ! the master has written the header
+    if (id == 0) then
+       close(iunit)
+       inquire(file=filename,size=hdrsize)
+    endif
+    call MPI_BCAST(hdrsize,1,MPI_INTEGER8,0,MPI_COMM_WORLD,mpierr)
+    dump_hdrsize = hdrsize
+    call get_environment_variable('PHANTOM_DUMPTMP',tmpdir,status=ierr)
+    if (ierr == 0 .and. len_trim(tmpdir) > 0) then
+       write(dump_scratch,"(a,i6.6)") trim(tmpdir)//'/'//trim(basename(filename))//'.part',id
+    else
+       write(dump_scratch,"(a,i6.6)") trim(filename)//'.part',id
+    endif
+    dump_unit = iunit
+    dump_t0 = MPI_WTIME()
+    open(unit=iunit,file=dump_scratch,status='replace',form='unformatted',iostat=ierr)
+    if (ierr /= 0) call error('start_threadwrite','can''t open scratch file '//trim(dump_scratch))
+    return
+ endif
+ dump_parallel = .false.
+#endif
  if (id  >  0) then
 #ifdef MPI
     call MPI_RECV(nowgo,1,MPI_INTEGER,id-1,99,MPI_COMM_WORLD,status,mpierr)
@@ -323,12 +375,86 @@ subroutine end_threadwrite(id)
  use io,       only:iverbose
 #ifdef MPI
  use mpi
- use io,       only:nprocs
+ use io,       only:nprocs,error
 #endif
  implicit none
  integer, intent(in) :: id
 #ifdef MPI
  integer :: nowgo
+ integer :: lt,ls,ierr,n
+ integer(kind=8) :: nbytes,offset,done,nchunk
+ integer(kind=8), allocatable :: sizes(:)
+ integer(kind=1), allocatable :: buf(:)
+ integer, parameter :: maxchunk = 64*1024*1024
+ real(kind=8) :: t1,t2,t3,t4,t5,tt(5)
+ logical :: preextend
+ real(kind=8), allocatable :: tall(:,:)
+ character(len=8) :: val
+
+ if (dump_parallel) then
+    t1 = MPI_WTIME()
+    preextend = .true.
+    call get_environment_variable('PHANTOM_PREEXTEND',val,status=ierr)
+    if (ierr == 0) then
+       read(val,*,iostat=ierr) n
+       if (ierr == 0 .and. n == 0) preextend = .false.
+    endif
+    close(dump_unit)
+    inquire(file=dump_scratch,size=nbytes)
+    allocate(sizes(nprocs))
+    call MPI_ALLGATHER(nbytes,1,MPI_INTEGER8,sizes,1,MPI_INTEGER8,MPI_COMM_WORLD,mpierr)
+    offset = dump_hdrsize
+    do n=1,id
+       offset = offset + sizes(n)
+    enddo
+    ! extend the file to its final length first: writing beyond the end of the file
+    ! from many nodes at once is slow on a parallel file system
+    if (id == 0 .and. preextend) then
+       open(newunit=lt,file=dump_target,status='old',access='stream',form='unformatted',action='write',iostat=ierr)
+       if (ierr == 0) then
+          write(lt,pos=dump_hdrsize+sum(sizes)) 0_1
+          close(lt)
+       endif
+    endif
+    deallocate(sizes)
+    if (preextend) call MPI_BARRIER(MPI_COMM_WORLD,mpierr)
+    t2 = MPI_WTIME()
+    ! copy the block to its place in the dump file
+    open(newunit=lt,file=dump_target,status='old',access='stream',form='unformatted',action='write',iostat=ierr)
+    if (ierr /= 0) call error('end_threadwrite','can''t open dumpfile '//trim(dump_target))
+    open(newunit=ls,file=dump_scratch,status='old',access='stream',form='unformatted',action='read',iostat=ierr)
+    if (ierr /= 0) call error('end_threadwrite','can''t read scratch file '//trim(dump_scratch))
+    nchunk = min(nbytes,int(maxchunk,kind=8))
+    allocate(buf(max(nchunk,1_8)))
+    done = 0
+    do while (done < nbytes)
+       n = int(min(nchunk,nbytes-done))
+       read(ls) buf(1:n)
+       write(lt,pos=offset+done+1) buf(1:n)
+       done = done + n
+    enddo
+    deallocate(buf)
+    close(ls,status='delete')
+    t3 = MPI_WTIME()
+    close(lt)
+    t4 = MPI_WTIME()
+    ! the dump is complete when this returns on all tasks
+    call MPI_BARRIER(MPI_COMM_WORLD,mpierr)
+    t5 = MPI_WTIME()
+    call get_environment_variable('PHANTOM_PARDUMP_TIMING',val,status=ierr)
+    if (ierr == 0) then
+       tt = (/t1-dump_t0,t2-t1,t3-t2,t4-t3,t5-t4/)
+       allocate(tall(5,nprocs))
+       call MPI_GATHER(tt,5,MPI_REAL8,tall,5,MPI_REAL8,0,MPI_COMM_WORLD,mpierr)
+       if (id == 0) then
+          print "(a,5(f7.3,i4))",' dump: max over tasks (task) of write block, close+sizes, copy, close, barrier: ',&
+             (maxval(tall(n,:)),maxloc(tall(n,:),1)-1,n=1,5)
+       endif
+       deallocate(tall)
+    endif
+    dump_parallel = .false.
+    return
+ endif
 #endif
 
  if (iverbose >= 3) print *,' thread ',id,' : finished write.'
@@ -340,6 +466,39 @@ subroutine end_threadwrite(id)
 #endif
 
 end subroutine end_threadwrite
+
+!--------------------------------------------------------------------
+!+
+!  PHANTOM_PARDUMP=0 switches off the parallel writing of dump files
+!+
+!--------------------------------------------------------------------
+logical function read_pardump()
+ character(len=16) :: val
+ integer :: ierr,ival
+
+ read_pardump = .true.
+ call get_environment_variable('PHANTOM_PARDUMP',val,status=ierr)
+ if (ierr == 0) then
+    read(val,*,iostat=ierr) ival
+    if (ierr == 0 .and. ival == 0) read_pardump = .false.
+ endif
+
+end function read_pardump
+
+!--------------------------------------------------------------------
+!+
+!  name of a file without its directory
+!+
+!--------------------------------------------------------------------
+function basename(filename)
+ character(len=*), intent(in) :: filename
+ character(len=len(filename)) :: basename
+ integer :: i
+
+ i = index(filename,'/',back=.true.)
+ basename = filename(i+1:)
+
+end function basename
 
 !--------------------------------------------------------------------
 !+
