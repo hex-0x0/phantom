@@ -313,9 +313,10 @@ module part
                        ilambda = 9, &
                        iedd   = 10, &
                        icv    = 11, &
-                       maxradprop = 11
+                       itlastrad = 12, & ! time of the last implicit radiation update
+                       maxradprop = 12
  character(len=*), parameter :: radprop_label(maxradprop) = &
-    (/'radFx ','radFy ','radFz ','kappa ','thick ','numph ','vorcl ','radP  ','lambda','edd   ','cv    '/)
+    (/'radFx ','radFy ','radFz ','kappa ','thick ','numph ','vorcl ','radP  ','lambda','edd   ','cv    ','tlast '/)
 !
 !--lightcurves, store du/dt for each particle
 !
@@ -407,7 +408,7 @@ module part
 !--size of the buffer required for transferring particle
 !  information between MPI threads
 !
- integer, parameter :: ipartbufsize = 137
+ integer, parameter :: ipartbufsize = 138
 
  real            :: hfact,Bextx,Bexty,Bextz,tolh
  integer         :: npart
@@ -665,6 +666,7 @@ end subroutine deallocate_part
 !+
 !----------------------------------------------------------------
 subroutine init_part
+ use io, only:id,nprocs
  integer :: i
 
  npart = 0
@@ -744,18 +746,33 @@ subroutine init_part
 
  ideadhead = 0
 !
-!--Initialise particle id's
+!--Initialise particle id's, unique across MPI tasks
 !
 !$omp parallel do default(none) &
-!$omp shared(iorig,maxp) &
+!$omp shared(iorig,maxp,id) &
 !$omp private(i)
  do i = 1,maxp
-    iorig(i) = i
+    iorig(i) = i + int(id,kind=8)*maxp
  enddo
 !$omp end parallel do
- norig = maxp
+ norig = int(nprocs,kind=8)*maxp
 
 end subroutine init_part
+
+!----------------------------------------------------------------
+!+
+!  a new particle ID. IDs above norig are given out in turn by the
+!  MPI tasks (task id gives norig+1+id, then norig increases by nprocs),
+!  so no two tasks give out the same ID while every task has the same norig
+!+
+!----------------------------------------------------------------
+integer(kind=8) function new_iorig()
+ use io, only:id,nprocs
+
+ new_iorig = norig + 1 + id
+ norig = norig + nprocs
+
+end function new_iorig
 
 !----------------------------------------------------------------
 !+
@@ -922,6 +939,8 @@ subroutine init_rho_from_h(i1,i2)
  if (present(i1)) ia = i1
  if (present(i2)) ib = i2
  iamtypei = igas
+ ! massoftype may have just been set by the calling routine
+ call sync_aprmassoftype()
 
  do i=ia,ib
     if (.not. isdead_or_accreted(xyzh(4,i))) then
@@ -1087,6 +1106,24 @@ subroutine recount_npartoftype
  enddo
 
 end subroutine recount_npartoftype
+
+!----------------------------------------------------------------
+!+
+!  set the mass of each particle type at every refinement level
+!  from massoftype (each level halves the mass of the previous one)
+!+
+!----------------------------------------------------------------
+subroutine sync_aprmassoftype
+ integer :: l,nlevels
+
+ ! loop bound is a variable because apr_maxlevel=0 without APR and
+ ! gfortran warns of a zero-trip loop for constant bounds, even inside an if
+ nlevels = apr_maxlevel
+ do l=1,nlevels
+    aprmassoftype(:,l) = massoftype(:)/2.**(l-1)
+ enddo
+
+end subroutine sync_aprmassoftype
 
 !----------------------------------------------
 !+
@@ -1386,8 +1423,7 @@ subroutine copy_particle(src,dst,new_part)
  if (itauL_alloc == 1) tau_lucy(dst) = tau_lucy(src)
 
  if (new_part) then
-    norig      = norig + 1
-    iorig(dst) = norig      ! we are creating a new particle; give it the new ID
+    iorig(dst) = new_iorig() ! we are creating a new particle; give it a new ID
  else
     iorig(dst) = iorig(src) ! we are moving the particle within the list; maintain ID
  endif
@@ -1501,8 +1537,7 @@ subroutine copy_particle_all(src,dst,new_part)
  endif
 
  if (new_part) then
-    norig      = norig + 1
-    iorig(dst) = norig      ! we are creating a new particle; give it the new ID
+    iorig(dst) = new_iorig() ! we are creating a new particle; give it a new ID
  else
     iorig(dst) = iorig(src) ! we are moving the particle within the list; maintain ID
  endif
