@@ -25,7 +25,7 @@ contains
 
 subroutine modify_dump(npart,npartoftype,massoftype,xyzh,vxyzu)
  use eos,           only:ieos,gamma,polyk,polyk2,init_eos
- use eos_barotropic, only:get_eos_barotropic
+ use eos_barotropic, only:get_eos_barotropic,rhocrit0cgs
  use part,          only:rhoh,igas,isdead_or_accreted
  integer, intent(inout) :: npart
  integer, intent(inout) :: npartoftype(:)
@@ -35,6 +35,7 @@ subroutine modify_dump(npart,npartoftype,massoftype,xyzh,vxyzu)
  real    :: rhoi,ponrhoi,spsoundi,gammai,tmax
 
  ieos = 8
+ rhocrit0cgs = 9.893e-19  ! warm-medium density of the sphere-in-box run; other barotropic parameters are the defaults
  call init_eos(ieos,ierr)
  tmax = 0.
  do i = 1,npart
@@ -46,7 +47,7 @@ subroutine modify_dump(npart,npartoftype,massoftype,xyzh,vxyzu)
  enddo
  ieos  = 2
  gamma = 5./3.
- print*,' set u = (P/rho)/(gamma-1) from the barotropic eos, max P/rho = ',tmax,'; output dump has ieos = 2, gamma = 5/3'
+ print*,' set u = (P/rho)/(gamma-1) from the barotropic eos, max P/rho = ',tmax,' (polyk2 = ',polyk2,'); output dump has ieos = 2, gamma = 5/3'
 
 end subroutine modify_dump
 
