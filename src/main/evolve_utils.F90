@@ -303,7 +303,8 @@ subroutine check_and_write_dump(time,tstart,tcpustart,rhomaxnow,nsteps,&
        dumpfile = getnextfilename(dumpfile,idumpfile)
        dumpfile_orig = trim(dumpfile)
     else
-       write(dumpfile,'(2a)') dumpfile(:index(dumpfile,'_')-1),'.restart'
+       ! plain assignment: an internal write into dumpfile itself gives an undefined (empty) name with ifort
+       dumpfile = dumpfile(:max(index(dumpfile,'_')-1,0))//'.restart'
     endif
  endif
 
