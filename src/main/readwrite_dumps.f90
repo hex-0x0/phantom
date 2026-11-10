@@ -86,7 +86,7 @@ recursive subroutine write_fulldump(t,dumpfile,ntotal,iorder,sphNG)
  integer(kind=8)    :: ilen(4)
  integer            :: nums(ndatatypes,4)
  integer            :: ipass,k,l,ioffset
- integer            :: ierr,nerr
+ integer            :: ierr,nerr,ierropen
  integer            :: nblocks,nblockarrays,narraylengths
  integer(kind=8)    :: nparttot
  logical            :: sphNGdump,write_itype,use_gas,parallel_write
@@ -138,6 +138,7 @@ recursive subroutine write_fulldump(t,dumpfile,ntotal,iorder,sphNG)
  !
  !--open dumpfile
  !
+ ierropen = 0
  masterthread: if (id==master) then
 
     if (idtmax_frac==0) then
@@ -150,35 +151,41 @@ recursive subroutine write_fulldump(t,dumpfile,ntotal,iorder,sphNG)
        write(iprint,"('-------->                        Writing sub-dumps: ',I4,' of',I4,a,'<--------',/)")  &
          idtmax_frac,idtmax_n,blankarray(1:ioffset)
     endif
-    call open_dumpfile_w(idump,dumpfile,fileid,ierr)
-    if (ierr /= 0) then
+    call open_dumpfile_w(idump,dumpfile,fileid,ierropen)
+    if (ierropen /= 0) then
        call error('write_fulldump','error creating new dumpfile '//trim(dumpfile))
-       return
+    else
+       !
+       !--single values
+       !
+       hdr = allocate_header(nint=maxphead,nreal=maxphead,err=ierr)
+
+       call fill_header(sphNGdump,t,nparttot,npartoftypetot,nblocks,nptmass,hdr,ierr)
+       if (ierr /= 0) call warning('write_fulldump','error filling header arrays')
+
+       call write_header(idump,hdr,ierr)
+       if (ierr /= 0) call error('write_fulldump','error writing header to dumpfile')
+
+       call free_header(hdr,ierr)
+       if (ierr /= 0) call error('write_fulldump','error deallocating header')
+       !
+       !--arrays
+       !
+       !--total number of blocks
+       !  each thread has up to 4 blocks (hydro variables, sink particles, radiative transfer and MHD)
+       !  repeated nblocks times (once for each MPI process)
+       !
+       nblockarrays = narraylengths*nblocks
+       write (idump,iostat=ierr) nblockarrays
     endif
-    !
-    !--single values
-    !
-    hdr = allocate_header(nint=maxphead,nreal=maxphead,err=ierr)
-
-    call fill_header(sphNGdump,t,nparttot,npartoftypetot,nblocks,nptmass,hdr,ierr)
-    if (ierr /= 0) call warning('write_fulldump','error filling header arrays')
-
-    call write_header(idump,hdr,ierr)
-    if (ierr /= 0) call error('write_fulldump','error writing header to dumpfile')
-
-    call free_header(hdr,ierr)
-    if (ierr /= 0) call error('write_fulldump','error deallocating header')
-    !
-    !--arrays
-    !
-    !--total number of blocks
-    !  each thread has up to 4 blocks (hydro variables, sink particles, radiative transfer and MHD)
-    !  repeated nblocks times (once for each MPI process)
-    !
-    nblockarrays = narraylengths*nblocks
-    write (idump,iostat=ierr) nblockarrays
 
  endif masterthread
+
+ !
+ !--all tasks give up together if the master could not open the file: the others would
+ !  otherwise wait in the collective calls below for a master that has already left
+ !
+ if (reduceall_mpi('max',ierropen) /= 0) return
 
  !
  !--columns computed from other arrays: once here, not in every pass of the
@@ -482,7 +489,7 @@ subroutine write_smalldump(t,dumpfile)
  character(len=*), intent(in) :: dumpfile
  integer(kind=8) :: ilen(4)
  integer         :: nums(ndatatypes,4)
- integer         :: ierr,ipass,k
+ integer         :: ierr,ierropen,ipass,k
  integer         :: nblocks,nblockarrays,narraylengths
  integer(kind=8) :: nparttot
  logical         :: write_itype
@@ -497,6 +504,7 @@ subroutine write_smalldump(t,dumpfile)
  narraylengths = 2
  if (mhd) narraylengths = 4
 
+ ierropen = 0
  masterthread: if (id==master) then
     !
     !--open dumpfile
@@ -504,32 +512,35 @@ subroutine write_smalldump(t,dumpfile)
     write(iprint,"(/,/,'-------->   TIME = ',g12.4,"// &
                 "': small dump written to file ',a,'   <--------',/)")  t,trim(dumpfile)
 
-    call open_dumpfile_w(idump,dumpfile,fileident('ST'),ierr,singleprec=.true.)
-    if (ierr /= 0) then
+    call open_dumpfile_w(idump,dumpfile,fileident('ST'),ierropen,singleprec=.true.)
+    if (ierropen /= 0) then
        call error('write_smalldump','could not write new dumpfile '//trim(dumpfile))
-       return
+    else
+       !
+       !--single values
+       !
+       hdr = allocate_header(nint=maxphead,nreal=maxphead,err=ierr)
+
+       call fill_header(.false.,t,nparttot,npartoftypetot,nblocks,nptmass,hdr,ierr)
+       if (ierr /= 0) call warning('write_smalldump','error filling header arrays')
+
+       call write_header(idump,hdr,ierr,singleprec=.true.)
+       if (ierr /= 0) call error('write_smalldump','error writing header to dumpfile')
+
+       call free_header(hdr,ierr)
+       if (ierr /= 0) call error('write_smalldump','error deallocating header')
+       !
+       !--arrays: number of array lengths
+       !
+       nblockarrays = narraylengths*nblocks
+       write (idump,iostat=ierr) nblockarrays
+       if (ierr /= 0) call error('write_smalldump','error writing nblockarrays')
     endif
-    !
-    !--single values
-    !
-    hdr = allocate_header(nint=maxphead,nreal=maxphead,err=ierr)
-
-    call fill_header(.false.,t,nparttot,npartoftypetot,nblocks,nptmass,hdr,ierr)
-    if (ierr /= 0) call warning('write_smalldump','error filling header arrays')
-
-    call write_header(idump,hdr,ierr,singleprec=.true.)
-    if (ierr /= 0) call error('write_smalldump','error writing header to dumpfile')
-
-    call free_header(hdr,ierr)
-    if (ierr /= 0) call error('write_smalldump','error deallocating header')
-    !
-    !--arrays: number of array lengths
-    !
-    nblockarrays = narraylengths*nblocks
-    write (idump,iostat=ierr) nblockarrays
-    if (ierr /= 0) call error('write_smalldump','error writing nblockarrays')
 
  endif masterthread
+
+ !--all tasks give up together if the master could not open the file (see write_fulldump)
+ if (reduceall_mpi('max',ierropen) /= 0) return
 
  call start_threadwrite(id,idump,dumpfile)
 
