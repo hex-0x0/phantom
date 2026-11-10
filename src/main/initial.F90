@@ -266,6 +266,7 @@ subroutine read_infile_and_initial_conditions(infile,logfile,evfile,dumpfile,tim
  real,             intent(out)   :: time
  integer,          intent(out)   :: ierr
  integer :: nerr,nwarn,irestart
+ character(len=len(dumpfile)) :: tmpname
  real :: hfactfile
 
  ierr = 0
@@ -304,7 +305,10 @@ subroutine read_infile_and_initial_conditions(infile,logfile,evfile,dumpfile,tim
 
  ! if starting from a restart dump, rename the dumpfile to that of the previous non-restart dump
  irestart = index(dumpfile,'.restart')
- if (irestart > 0) write(dumpfile,'(2a,i5.5)') dumpfile(:irestart-1),'_',idumpfile
+ if (irestart > 0) then
+    write(tmpname,'(2a,i5.5)') dumpfile(:irestart-1),'_',idumpfile
+    dumpfile = tmpname
+ endif
 
 end subroutine read_infile_and_initial_conditions
 
