@@ -17,8 +17,6 @@ module eos_stamatellos
 ! :Dependencies: allocutils, datafiles, dim, io, part
 !
 
- ! the per-particle arrays (gradP_cool, ttherm_store, ueqi_store, tau_store, du_store, duSPH)
- ! live in module part so that they move with the particles; they are allocated in init_coolra
  use part, only:gradP_cool,ttherm_store,ueqi_store,tau_store,du_store,duSPH
  implicit none
  real, allocatable, public :: optable(:,:,:)
