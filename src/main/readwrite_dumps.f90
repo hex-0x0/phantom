@@ -408,7 +408,8 @@ end subroutine write_fulldump
 !  and its bytes in the order they are in memory (put_rec writes them as
 !  they are), and if MPI-IO does direct I/O on the file (mpiio_open): ordinary
 !  writes from several tasks into one file are no faster than the tasks
-!  taking turns.  The master task closes the header to check it and to get
+!  taking turns.  PHANTOM_DUMP_PARALLEL=always skips the direct I/O test.
+!  The master task closes the header to check it and to get
 !  its size (hdrbytes); the file is then open through MPI-IO, or, if the
 !  tasks are to take turns, open again on the master to append.
 !+
@@ -421,16 +422,17 @@ logical function dump_parallel_ok(dumpfile,hdrbytes) result(ok)
  use dump_utils, only:int1
  character(len=*), intent(in)  :: dumpfile
  integer(kind=8),  intent(out) :: hdrbytes
- character(len=3) :: val
+ character(len=8) :: val
  integer(kind=1)  :: b(64)
  integer(kind=4)  :: m
  integer          :: iu,ierr,ierrmpi
- logical          :: direct
+ logical          :: direct,always
 
  hdrbytes = 0_8
  ok = mpi .and. nprocs > 1 .and. &
       (index(compiler_version(),'GCC') > 0 .or. index(compiler_version(),'Intel') > 0)
  call get_environment_variable('PHANTOM_DUMP_PARALLEL',val)
+ always = (trim(val) == 'always')
  if (scan(val(1:1),'nN0fF') > 0 .or. dump_parallel_failed) ok = .false.
  if (.not.ok) return
  if (id==master) then
@@ -450,7 +452,7 @@ logical function dump_parallel_ok(dumpfile,hdrbytes) result(ok)
  call bcast_mpi(hdrbytes)
  if (ok) then
     call mpiio_open(dumpfile,ierrmpi,direct)
-    ok = (reduceall_mpi('max',merge(1,0,ierrmpi /= 0 .or. .not.direct)) == 0)
+    ok = (reduceall_mpi('max',merge(1,0,ierrmpi /= 0 .or. (.not.direct .and. .not.always))) == 0)
     if (.not.ok .and. ierrmpi == 0) call mpiio_close(ierr)
  endif
  if (.not.ok .and. id==master) then
